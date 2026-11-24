@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -127,11 +128,13 @@ def test_pick_random_image_empty_returns_none():
 
 
 def test_data_manager_group_defaults_and_strict_limits():
-    assert pig_data_manager.export_group_config(10001) == {"max_forward_results": 5}
-    assert pig_data_manager.get_group_config(10001) == {
-        "auto_push_enabled": False,
-        "query_enabled": False,
+    assert pig_data_manager.export_group_config(10001) == {
+        "max_forward_results": 5,
+        "query_cooldown_enabled": False,
+        "query_cooldown_seconds": 60,
     }
+    assert pig_data_manager.get_group_config(10001)["auto_push_enabled"] is False
+    assert pig_data_manager.get_group_config(10001)["query_enabled"] is False
     assert 10001 not in pig_data_manager.list_configured_groups()
 
     pig_data_manager.update_group_config(10001, {"max_forward_results": 8})
@@ -148,7 +151,7 @@ def test_group_max_forward_limit_is_independent_and_preserves_feature_flags():
     pig_data_manager.set_auto_push_enabled(10001, True)
     pig_data_manager.set_query_enabled(10002, True)
 
-    assert pig_data_manager.export_group_config(19999) == {"max_forward_results": 5}
+    assert pig_data_manager.get_max_forward_results(19999) == 5
     assert 19999 not in pig_data_manager.list_configured_groups()
 
     assert pig_data_manager.update_group_config(10001, {"max_forward_results": 2}) == {
@@ -158,14 +161,10 @@ def test_group_max_forward_limit_is_independent_and_preserves_feature_flags():
     assert pig_data_manager.get_max_forward_results(10001) == 2
     assert pig_data_manager.get_max_forward_results(10002) == 8
     assert pig_data_manager.get_max_forward_results(19999) == 5
-    assert pig_data_manager.get_group_config(10001) == {
-        "auto_push_enabled": True,
-        "query_enabled": False,
-    }
-    assert pig_data_manager.get_group_config(10002) == {
-        "auto_push_enabled": False,
-        "query_enabled": True,
-    }
+    assert pig_data_manager.get_group_config(10001)["auto_push_enabled"] is True
+    assert pig_data_manager.get_group_config(10001)["query_enabled"] is False
+    assert pig_data_manager.get_group_config(10002)["auto_push_enabled"] is False
+    assert pig_data_manager.get_group_config(10002)["query_enabled"] is True
 
 
 def test_forward_selection_uses_group_specific_limit():
@@ -205,8 +204,13 @@ def test_legacy_import_is_once_and_manager_instances_share_committed_changes(tmp
     second = DataManager(legacy_config_path=str(path), configuration_db_path=database_path)
     assert second.get_max_forward_results(123456) == 2
     second.set_auto_push_enabled(123456, True)
-    assert first.get_group_config(123456) == {"query_enabled": False, "auto_push_enabled": True}
-    assert first.export_group_config(123456) == {"max_forward_results": 2}
+    assert first.get_group_config(123456)["query_enabled"] is False
+    assert first.get_group_config(123456)["auto_push_enabled"] is True
+    assert first.export_group_config(123456) == {
+        "max_forward_results": 2,
+        "query_cooldown_enabled": False,
+        "query_cooldown_seconds": 60,
+    }
     assert first.get_max_forward_results(234567) == 3
 
 
@@ -389,6 +393,53 @@ async def test_handle_pig_command_query_cooldown_blocks_frequent_requests(mocker
     assert fetch_mock.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_group_cooldown_is_opt_in_shared_and_applies_live(mocker, enable_plugin):
+    from xducraft_bot.shared.configuration import ConfigContext
+    from xducraft_pig_bot.configuration import bind_configuration
+
+    first_group, second_group = 123456, 234567
+    enable_plugin("pig_bot", first_group, second_group)
+    for group_id in (first_group, second_group):
+        pig_data_manager.set_query_enabled(group_id, True)
+    event_type, event = build_fake_group_event(first_group)
+    mocker.patch.object(pig_module, "GroupMessageEvent", event_type)
+    clock = SimpleNamespace(value=100.0)
+    mocker.patch.object(pig_module, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    fetch = mocker.patch.object(pig_module, "fetch_all_images", AsyncMock(return_value=[
+        {"id": "1", "title": "猪图", "filename": "pig.png", "url": "https://example.com/pig.png"},
+    ]))
+    finish = mocker.patch.object(pig_module.pig_command, "finish", AsyncMock())
+    bot, command = MagicMock(), build_message_mock("")
+    resource = bind_configuration(pig_data_manager).resources["group"]
+    ctx = ConfigContext(first_group)
+
+    await handle_pig_command(bot, event, command)
+    await handle_pig_command(bot, event, command)
+    assert fetch.await_count == 2
+
+    resource.write(ctx, {"query_cooldown_enabled": True})
+    await handle_pig_command(bot, event, command)
+    event.user_id += 1
+    clock.value = 101.0
+    await handle_pig_command(bot, event, build_message_mock("猪图"))
+    assert fetch.await_count == 3
+    assert "59.0 秒" in finish.await_args.args[0]
+
+    event.group_id = second_group
+    await handle_pig_command(bot, event, command)
+    assert fetch.await_count == 4
+
+    event.group_id = first_group
+    resource.write(ctx, {"query_cooldown_enabled": True, "query_cooldown_seconds": 20})
+    clock.value = 120.0
+    await handle_pig_command(bot, event, command)
+    assert fetch.await_count == 5
+    resource.write(ctx, {"query_cooldown_enabled": False, "query_cooldown_seconds": 20})
+    await handle_pig_command(bot, event, command)
+    assert fetch.await_count == 6
+
+
 
 def test_pig_declaration_validates_independent_group_revisions():
     from xducraft_bot.shared.configuration import ConfigContext, ConfigurationError
@@ -398,16 +449,23 @@ def test_pig_declaration_validates_independent_group_revisions():
     resource = declaration.resources["group"]
     ctx = ConfigContext(10001)
     before = resource.read(ctx)
-    resource.write(ctx, {"max_forward_results": 2})
+    resource.write(ctx, {
+        "max_forward_results": 2, "query_cooldown_enabled": True, "query_cooldown_seconds": 120,
+    })
     current = resource.read(ctx)
-    assert current.values == {"max_forward_results": 2}
+    assert current.values == {
+        "max_forward_results": 2, "query_cooldown_enabled": True, "query_cooldown_seconds": 120,
+    }
     assert current.revision_values != before.revision_values
     resource.write(ConfigContext(10002), {"max_forward_results": 8})
     assert resource.read(ctx).revision_values == current.revision_values
-    assert resource.read(ConfigContext(10003)).values == {"max_forward_results": 5}
+    assert resource.read(ConfigContext(10003)).values == before.values
     for invalid in (0, None, True, "8"):
         with pytest.raises(ConfigurationError):
             resource.write(ctx, {"max_forward_results": invalid})
+    for invalid in (0, -1, 86401, True, "60"):
+        with pytest.raises(ConfigurationError):
+            resource.write(ctx, {"query_cooldown_enabled": True, "query_cooldown_seconds": invalid})
     assert resource.read(ctx).revision_values == current.revision_values
 
 @pytest.mark.asyncio

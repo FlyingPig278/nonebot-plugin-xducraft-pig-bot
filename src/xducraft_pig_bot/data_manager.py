@@ -16,6 +16,8 @@ DEFAULT_DATA_DIR = str(plugin_data_dir(
 ))
 DEFAULT_DATA_FILE = os.path.join(DEFAULT_DATA_DIR, "pig_config.json")
 DEFAULT_MAX_FORWARD_RESULTS = 5
+DEFAULT_QUERY_COOLDOWN_SECONDS = 60
+MAX_QUERY_COOLDOWN_SECONDS = 86400
 
 
 class DataManager:
@@ -37,6 +39,8 @@ class DataManager:
             "auto_push_enabled": False,
             "query_enabled": False,
             "max_forward_results": DEFAULT_MAX_FORWARD_RESULTS,
+            "query_cooldown_enabled": False,
+            "query_cooldown_seconds": DEFAULT_QUERY_COOLDOWN_SECONDS,
         }
 
     @staticmethod
@@ -80,20 +84,23 @@ class DataManager:
                 cfg["max_forward_results"] = self._normalize_max_forward_results(
                     values.get("max_forward_results", cfg["max_forward_results"])
                 )
+                cfg["query_cooldown_enabled"] = values.get("query_cooldown_enabled") is True
+                seconds = values.get("query_cooldown_seconds")
+                if type(seconds) is int and 1 <= seconds <= MAX_QUERY_COOLDOWN_SECONDS:
+                    cfg["query_cooldown_seconds"] = seconds
             data["groups"][str(gid)] = cfg
         if legacy:
             for gid in known_groups:
                 data["groups"].setdefault(str(gid), {
-                    "auto_push_enabled": False,
+                    **self._default_group_config(),
                     "query_enabled": True,
                     "max_forward_results": legacy_limit,
                 })
         return data
 
-    def get_group_config(self, group_id: int) -> Dict[str, bool]:
-        cfg = self._store.load()["groups"].get(str(group_id), {})
-        return {"auto_push_enabled": bool(cfg.get("auto_push_enabled", False)),
-                "query_enabled": bool(cfg.get("query_enabled", False))}
+    def get_group_config(self, group_id: int) -> Dict[str, Any]:
+        cfg = self._store.load()["groups"].get(str(group_id))
+        return self._default_group_config() if cfg is None else cfg
 
     def _set_group_enabled(self, group_id: int, key: str, enabled: bool) -> bool:
         def mutate(data):
@@ -118,26 +125,39 @@ class DataManager:
         return sorted(int(gid) for gid in self._store.load()["groups"]
                       if str(gid).isdigit() and int(gid) > 0)
 
-    def export_group_config(self, group_id: int) -> Dict[str, int]:
-        cfg = self._store.load()["groups"].get(str(group_id), {})
-        return {"max_forward_results": self._normalize_max_forward_results(
-            cfg.get("max_forward_results", DEFAULT_MAX_FORWARD_RESULTS)
-        )}
+    def export_group_config(self, group_id: int) -> Dict[str, Any]:
+        cfg = self.get_group_config(group_id)
+        return {
+            "max_forward_results": cfg["max_forward_results"],
+            "query_cooldown_enabled": cfg["query_cooldown_enabled"],
+            "query_cooldown_seconds": cfg["query_cooldown_seconds"],
+        }
 
-    def update_group_config(self, group_id: int, changes: Dict[str, Any]) -> Dict[str, int]:
-        if int(group_id) <= 0 or not isinstance(changes, dict) or set(changes) != {"max_forward_results"}:
+    def update_group_config(self, group_id: int, changes: Dict[str, Any]) -> Dict[str, Any]:
+        if int(group_id) <= 0 or not isinstance(changes, dict) or not changes or changes.keys() - {
+            "max_forward_results", "query_cooldown_enabled", "query_cooldown_seconds",
+        }:
             raise ValueError("invalid_pig_group_config")
-        value = changes["max_forward_results"]
-        if type(value) is not int or value < 1:
-            raise ValueError("invalid_max_forward_results")
+        if "max_forward_results" in changes:
+            limit = changes["max_forward_results"]
+            if type(limit) is not int or limit < 1:
+                raise ValueError("invalid_max_forward_results")
+        if "query_cooldown_enabled" in changes and type(changes["query_cooldown_enabled"]) is not bool:
+            raise ValueError("invalid_query_cooldown_enabled")
+        if "query_cooldown_seconds" in changes:
+            seconds = changes["query_cooldown_seconds"]
+            if type(seconds) is not int or not 1 <= seconds <= MAX_QUERY_COOLDOWN_SECONDS:
+                raise ValueError("invalid_query_cooldown_seconds")
+
         def mutate(data):
             cfg = data["groups"].setdefault(str(group_id), self._default_group_config())
-            cfg["max_forward_results"] = value
-            return {"max_forward_results": value}
+            cfg.update(changes)
+            return dict(changes)
+
         return self._store.mutate(mutate)
 
     def get_max_forward_results(self, group_id: int) -> int:
-        return self.export_group_config(group_id)["max_forward_results"]
+        return self.get_group_config(group_id)["max_forward_results"]
 
 
 pig_data_manager = DataManager()

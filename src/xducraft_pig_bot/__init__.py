@@ -62,7 +62,7 @@ PIG_BASE_URL = "https://www.pighub.top"
 PIG_ALL_IMAGES_API = f"{PIG_BASE_URL}/api/images?sort=0"
 AUTO_PUSH_INTERVAL_SECONDS = 6 * 60 * 60
 REQUEST_TIMEOUT_SECONDS = 15.0
-QUERY_COOLDOWN_SECONDS = 3.0
+PRIVATE_QUERY_COOLDOWN_SECONDS = 3.0
 
 COMMAND_USAGE = (
     "用法:\n"
@@ -76,7 +76,7 @@ ENABLE_ACTIONS = {"on", "open", "enable", "start", "开启", "打开", "开", "�
 DISABLE_ACTIONS = {"off", "close", "disable", "stop", "关闭", "关", "停用"}
 
 _push_lock = asyncio.Lock()
-_query_cooldown_tracker: Dict[str, float] = {}
+_query_cooldown_tracker: Dict[tuple[Optional[int], Optional[int]], float] = {}
 
 pig_command = on_command(
     "pig",
@@ -273,14 +273,17 @@ async def _send_merged_pig_images(
     return True
 
 
-def _check_query_cooldown(user_id: int) -> float:
+def _check_query_cooldown(group_id: Optional[int], user_id: int, seconds: float) -> float:
+    key = (group_id, user_id if group_id is None else None)
+    if not seconds:
+        _query_cooldown_tracker.pop(key, None)
+        return 0.0
     now = time.monotonic()
-    key = str(user_id)
     last_time = _query_cooldown_tracker.get(key)
     if last_time is not None:
         elapsed = now - last_time
-        if elapsed < QUERY_COOLDOWN_SECONDS:
-            return QUERY_COOLDOWN_SECONDS - elapsed
+        if elapsed < seconds:
+            return seconds - elapsed
 
     _query_cooldown_tracker[key] = now
     return 0.0
@@ -310,10 +313,12 @@ async def handle_pig_command(bot: Bot, event: MessageEvent, args: Message = Comm
 
         if subcommand == "status":
             cfg = pig_data_manager.get_group_config(event.group_id)
+            cooldown = f"{cfg['query_cooldown_seconds']} 秒" if cfg["query_cooldown_enabled"] else "关闭"
             await pig_command.finish(
                 "本群猪猪插件状态:\n"
                 f"自动推送: {'开启' if cfg['auto_push_enabled'] else '关闭'}\n"
-                f"手动查询: {'开启' if cfg['query_enabled'] else '关闭'}"
+                f"手动查询: {'开启' if cfg['query_enabled'] else '关闭'}\n"
+                f"查询冷却: {cooldown}"
             )
             return
 
@@ -336,13 +341,15 @@ async def handle_pig_command(bot: Bot, event: MessageEvent, args: Message = Comm
         await _finish_status(pig_command, f"本群{label}已是{'开启' if enabled else '关闭'}状态")
         return
 
-    if isinstance(event, GroupMessageEvent):
-        cfg = pig_data_manager.get_group_config(event.group_id)
+    cooldown_seconds = PRIVATE_QUERY_COOLDOWN_SECONDS
+    if group_id is not None:
+        cfg = pig_data_manager.get_group_config(group_id)
         if not cfg["query_enabled"]:
             await _finish_status(pig_command, "本群已关闭猪猪图查询功能，请联系管理员开启。")
             return
+        cooldown_seconds = cfg["query_cooldown_seconds"] if cfg["query_cooldown_enabled"] else 0
 
-    cooldown_left = _check_query_cooldown(event.user_id)
+    cooldown_left = _check_query_cooldown(group_id, event.user_id, cooldown_seconds)
     if cooldown_left > 0:
         await _finish_status(pig_command, f"查询过于频繁，请在 {cooldown_left:.1f} 秒后再试。")
         return
